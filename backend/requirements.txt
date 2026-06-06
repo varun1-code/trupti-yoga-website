@@ -15,3 +15,6 @@ starlette
 
 # JWT authentication
 PyJWT
+
+# PostgreSQL driver
+psycopg2-binary

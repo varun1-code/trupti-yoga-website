@@ -1,77 +1,88 @@
-import sqlite3
-from pathlib import Path
+import os
+import psycopg2
+import psycopg2.extras
 
-DB_PATH = Path(__file__).parent / "enrollments.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = False
     return conn
+
+
+def dict_row(cursor, row):
+    """Convert a row to a dict using cursor column names."""
+    cols = [desc[0] for desc in cursor.description]
+    return dict(zip(cols, row))
+
+
+def fetchone_dict(cursor):
+    row = cursor.fetchone()
+    return dict_row(cursor, row) if row else None
+
+
+def fetchall_dict(cursor):
+    rows = cursor.fetchall()
+    cols = [desc[0] for desc in cursor.description]
+    return [dict(zip(cols, row)) for row in rows]
 
 
 def init_db():
     conn = get_connection()
-    conn.execute("""
+    cur = conn.cursor()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            id          SERIAL PRIMARY KEY,
             name        TEXT    NOT NULL,
             phone       TEXT    NOT NULL,
             email       TEXT    NOT NULL UNIQUE,
             location    TEXT    NOT NULL,
             password    TEXT    NOT NULL,
-            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at  TIMESTAMPTZ DEFAULT NOW()
         )
     """)
-    conn.execute("""
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
-            id                INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id           INTEGER NOT NULL,
+            id                SERIAL PRIMARY KEY,
+            user_id           INTEGER NOT NULL REFERENCES users(id),
             plan              TEXT    NOT NULL,
             amount            INTEGER NOT NULL,
             transaction_id    TEXT    NOT NULL DEFAULT '',
             currency          TEXT    NOT NULL DEFAULT 'INR',
             client_meet_link  TEXT    DEFAULT '',
             status            TEXT    NOT NULL DEFAULT 'pending',
-            created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-            approved_at       DATETIME,
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            created_at        TIMESTAMPTZ DEFAULT NOW(),
+            approved_at       TIMESTAMPTZ
         )
     """)
-    conn.execute("""
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT ''
         )
     """)
-    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('meet_6am', '')")
-    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('meet_8am', '')")
-    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('meet_11am', '')")
 
-    conn.execute("""
+    cur.execute("INSERT INTO settings (key, value) VALUES ('meet_6am',  '') ON CONFLICT (key) DO NOTHING")
+    cur.execute("INSERT INTO settings (key, value) VALUES ('meet_8am',  '') ON CONFLICT (key) DO NOTHING")
+    cur.execute("INSERT INTO settings (key, value) VALUES ('meet_11am', '') ON CONFLICT (key) DO NOTHING")
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS schedules (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            payment_id     INTEGER NOT NULL,
-            user_id        INTEGER NOT NULL,
+            id             SERIAL PRIMARY KEY,
+            payment_id     INTEGER NOT NULL REFERENCES payments(id),
+            user_id        INTEGER NOT NULL REFERENCES users(id),
             proposed_by    TEXT    NOT NULL,
             proposed_time  TEXT    NOT NULL,
             notes          TEXT    DEFAULT '',
             status         TEXT    NOT NULL DEFAULT 'pending',
-            created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (payment_id) REFERENCES payments(id),
-            FOREIGN KEY (user_id)    REFERENCES users(id)
+            created_at     TIMESTAMPTZ DEFAULT NOW()
         )
     """)
 
-    # Migrate existing databases — add new columns if missing
-    for col, definition in [
-        ("currency",         "TEXT NOT NULL DEFAULT 'INR'"),
-        ("client_meet_link", "TEXT DEFAULT ''"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE payments ADD COLUMN {col} {definition}")
-        except sqlite3.OperationalError:
-            pass
-
     conn.commit()
+    cur.close()
     conn.close()

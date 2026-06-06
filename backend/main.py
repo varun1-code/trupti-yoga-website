@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import hashlib, sqlite3, os
+import hashlib, os
 import jwt
+import psycopg2
 from datetime import datetime, timedelta, timezone
-from models import get_connection, init_db
+from models import get_connection, init_db, fetchone_dict, fetchall_dict
 from email_utils import (send_welcome, send_payment_received, send_admin_new_payment,
                          send_payment_approved, send_payment_rejected)
 
@@ -60,11 +61,17 @@ PLAN_DAYS = {
 }
 
 
-def calc_expiry(approved_at_str: str | None, plan: str):
-    if not approved_at_str:
+def calc_expiry(approved_at_val, plan: str):
+    if not approved_at_val:
         return None, False
-    approved_at = datetime.fromisoformat(approved_at_str)
-    expires_at  = approved_at + timedelta(days=PLAN_DAYS.get(plan, 30))
+    if isinstance(approved_at_val, str):
+        approved_at = datetime.fromisoformat(approved_at_val)
+    else:
+        approved_at = approved_at_val
+    # make naive for comparison
+    if approved_at.tzinfo is not None:
+        approved_at = approved_at.replace(tzinfo=None)
+    expires_at = approved_at + timedelta(days=PLAN_DAYS.get(plan, 30))
     return expires_at.isoformat(), datetime.now() > expires_at
 
 
@@ -98,7 +105,7 @@ class PaymentRequest(BaseModel):
     plan: str
     transaction_id: str = ""
     currency: str = "INR"
-    paypal_order_id: str = ""   # set for PayPal payments → auto-approved
+    paypal_order_id: str = ""
 
 class AdminLoginRequest(BaseModel):
     email: str
@@ -128,15 +135,18 @@ class AdminScheduleProposeRequest(BaseModel):
 @app.post("/signup")
 def signup(data: SignupRequest):
     conn = get_connection()
+    cur = conn.cursor()
     try:
-        conn.execute(
-            "INSERT INTO users (name, phone, email, location, password) VALUES (?, ?, ?, ?, ?)",
+        cur.execute(
+            "INSERT INTO users (name, phone, email, location, password) VALUES (%s, %s, %s, %s, %s)",
             (data.name, data.phone, data.email, data.location, hash_password(data.password))
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
         raise HTTPException(status_code=400, detail="Email already registered")
     finally:
+        cur.close()
         conn.close()
     send_welcome(data.email, data.name)
     return {"message": "Account created successfully"}
@@ -145,10 +155,13 @@ def signup(data: SignupRequest):
 @app.post("/login")
 def login(data: LoginRequest):
     conn = get_connection()
-    user = conn.execute(
-        "SELECT * FROM users WHERE email = ? AND password = ?",
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM users WHERE email = %s AND password = %s",
         (data.email, hash_password(data.password))
-    ).fetchone()
+    )
+    user = fetchone_dict(cur)
+    cur.close()
     conn.close()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -158,7 +171,6 @@ def login(data: LoginRequest):
 
 @app.post("/logout")
 def logout(_: int = Depends(get_current_user)):
-    # JWT is stateless — the client drops the token; nothing to invalidate server-side
     return {"message": "Logged out"}
 
 
@@ -171,30 +183,37 @@ def submit_payment(data: PaymentRequest, user_id: int = Depends(get_current_user
         raise HTTPException(status_code=400, detail="Invalid plan")
     amount = amounts[data.plan]
     conn = get_connection()
-    existing = conn.execute(
-        "SELECT * FROM payments WHERE user_id = ? AND status IN ('pending', 'approved') ORDER BY created_at DESC LIMIT 1",
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT * FROM payments WHERE user_id = %s AND status IN ('pending', 'approved') ORDER BY created_at DESC LIMIT 1",
         (user_id,)
-    ).fetchone()
+    )
+    existing = fetchone_dict(cur)
     if existing:
         if existing["status"] == "pending":
-            conn.close()
+            cur.close(); conn.close()
             raise HTTPException(status_code=400, detail="You already have a payment awaiting approval")
         _, is_expired = calc_expiry(existing["approved_at"], existing["plan"])
         if not is_expired:
-            conn.close()
+            cur.close(); conn.close()
             raise HTTPException(status_code=400, detail="You already have an active membership")
-    is_paypal = bool(data.paypal_order_id)
+
+    is_paypal  = bool(data.paypal_order_id)
     status     = "approved" if is_paypal else "pending"
     approved_at = datetime.now().isoformat() if is_paypal else None
 
-    conn.execute(
-        "INSERT INTO payments (user_id, plan, amount, transaction_id, currency, status, approved_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    cur.execute(
+        "INSERT INTO payments (user_id, plan, amount, transaction_id, currency, status, approved_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
         (user_id, data.plan, amount, data.paypal_order_id or data.transaction_id, data.currency, status, approved_at)
     )
     conn.commit()
-    # Fetch user details for emails before closing
-    user = conn.execute("SELECT name, email FROM users WHERE id = ?", (user_id,)).fetchone()
+
+    cur.execute("SELECT name, email FROM users WHERE id = %s", (user_id,))
+    user = fetchone_dict(cur)
+    cur.close()
     conn.close()
+
     u_name, u_email = user["name"], user["email"]
     amt_str = str(amount)
 
@@ -202,8 +221,7 @@ def submit_payment(data: PaymentRequest, user_id: int = Depends(get_current_user
         expires_at, _ = calc_expiry(approved_at, data.plan)
         exp_str = None
         if expires_at:
-            from datetime import datetime as dt
-            exp_str = dt.fromisoformat(expires_at).strftime("%d %b %Y")
+            exp_str = datetime.fromisoformat(expires_at).strftime("%d %b %Y")
         send_payment_approved(u_email, u_name, data.plan, amt_str, data.currency, exp_str)
     else:
         send_payment_received(u_email, u_name, data.plan, amt_str, data.currency)
@@ -219,42 +237,51 @@ def submit_payment(data: PaymentRequest, user_id: int = Depends(get_current_user
 @app.get("/dashboard")
 def get_dashboard(user_id: int = Depends(get_current_user)):
     conn = get_connection()
-    user = conn.execute("SELECT name, email, phone, location FROM users WHERE id = ?", (user_id,)).fetchone()
-    payment = conn.execute(
-        "SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+    cur = conn.cursor()
+
+    cur.execute("SELECT name, email, phone, location FROM users WHERE id = %s", (user_id,))
+    user = fetchone_dict(cur)
+    if not user:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    cur.execute(
+        "SELECT * FROM payments WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
         (user_id,)
-    ).fetchone()
+    )
+    payment = fetchone_dict(cur)
+
     result = {
         "name": user["name"], "email": user["email"],
         "phone": user["phone"], "location": user["location"],
         "payment": None,
     }
+
     if payment:
-        p = dict(payment)
         meet_6am = meet_8am = meet_11am = ""
-        expires_at, is_expired = calc_expiry(p.get("approved_at"), p.get("plan", ""))
-        is_1to1 = p.get("plan", "").startswith("1to1")
-        if p["status"] == "approved" and not is_expired and not is_1to1:
-            rows = conn.execute(
-                "SELECT key, value FROM settings WHERE key IN ('meet_6am','meet_8am','meet_11am')"
-            ).fetchall()
-            links = {r["key"]: r["value"] for r in rows}
+        expires_at, is_expired = calc_expiry(payment.get("approved_at"), payment.get("plan", ""))
+        is_1to1 = payment.get("plan", "").startswith("1to1")
+        if payment["status"] == "approved" and not is_expired and not is_1to1:
+            cur.execute("SELECT key, value FROM settings WHERE key IN ('meet_6am','meet_8am','meet_11am')")
+            links = {r[0]: r[1] for r in cur.fetchall()}
             meet_6am  = links.get("meet_6am", "")
             meet_8am  = links.get("meet_8am", "")
             meet_11am = links.get("meet_11am", "")
         result["payment"] = {
-            "plan":             p["plan"],
-            "amount":           p["amount"],
-            "currency":         p.get("currency") or "INR",
-            "status":           p["status"],
+            "plan":             payment["plan"],
+            "amount":           payment["amount"],
+            "currency":         payment.get("currency") or "INR",
+            "status":           payment["status"],
             "expires_at":       expires_at,
             "is_expired":       is_expired,
             "is_1to1":          is_1to1,
-            "client_meet_link": p.get("client_meet_link") or "",
+            "client_meet_link": payment.get("client_meet_link") or "",
             "meet_6am":         meet_6am,
             "meet_8am":         meet_8am,
             "meet_11am":        meet_11am,
         }
+
+    cur.close()
     conn.close()
     return result
 
@@ -264,29 +291,32 @@ def get_dashboard(user_id: int = Depends(get_current_user)):
 @app.get("/schedule")
 def get_my_schedules(user_id: int = Depends(get_current_user)):
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM schedules WHERE user_id = ? ORDER BY created_at DESC",
-        (user_id,)
-    ).fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM schedules WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+    rows = fetchall_dict(cur)
+    cur.close()
     conn.close()
-    return [dict(r) for r in rows]
+    return rows
 
 
 @app.post("/schedule/propose")
 def propose_schedule(data: ScheduleProposeRequest, user_id: int = Depends(get_current_user)):
     conn = get_connection()
-    payment = conn.execute(
-        "SELECT * FROM payments WHERE user_id = ? AND status = 'approved' AND plan LIKE '1to1_%' ORDER BY created_at DESC LIMIT 1",
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM payments WHERE user_id = %s AND status = 'approved' AND plan LIKE '1to1_%%' ORDER BY created_at DESC LIMIT 1",
         (user_id,)
-    ).fetchone()
+    )
+    payment = fetchone_dict(cur)
     if not payment:
-        conn.close()
+        cur.close(); conn.close()
         raise HTTPException(status_code=400, detail="You do not have an active One-to-One membership")
-    conn.execute(
-        "INSERT INTO schedules (payment_id, user_id, proposed_by, proposed_time, notes) VALUES (?, ?, 'client', ?, ?)",
+    cur.execute(
+        "INSERT INTO schedules (payment_id, user_id, proposed_by, proposed_time, notes) VALUES (%s, %s, 'client', %s, %s)",
         (payment["id"], user_id, data.proposed_time, data.notes)
     )
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Session time proposed. Awaiting admin confirmation."}
 
@@ -294,14 +324,15 @@ def propose_schedule(data: ScheduleProposeRequest, user_id: int = Depends(get_cu
 @app.post("/schedule/accept/{schedule_id}")
 def accept_schedule(schedule_id: int, user_id: int = Depends(get_current_user)):
     conn = get_connection()
-    s = conn.execute(
-        "SELECT * FROM schedules WHERE id = ? AND user_id = ?", (schedule_id, user_id)
-    ).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM schedules WHERE id = %s AND user_id = %s", (schedule_id, user_id))
+    s = fetchone_dict(cur)
     if not s or s["proposed_by"] != "admin":
-        conn.close()
+        cur.close(); conn.close()
         raise HTTPException(status_code=404, detail="Schedule not found")
-    conn.execute("UPDATE schedules SET status = 'confirmed' WHERE id = ?", (schedule_id,))
+    cur.execute("UPDATE schedules SET status = 'confirmed' WHERE id = %s", (schedule_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Session confirmed"}
 
@@ -309,14 +340,15 @@ def accept_schedule(schedule_id: int, user_id: int = Depends(get_current_user)):
 @app.post("/schedule/reject/{schedule_id}")
 def reject_schedule(schedule_id: int, user_id: int = Depends(get_current_user)):
     conn = get_connection()
-    s = conn.execute(
-        "SELECT * FROM schedules WHERE id = ? AND user_id = ?", (schedule_id, user_id)
-    ).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM schedules WHERE id = %s AND user_id = %s", (schedule_id, user_id))
+    s = fetchone_dict(cur)
     if not s or s["proposed_by"] != "admin":
-        conn.close()
+        cur.close(); conn.close()
         raise HTTPException(status_code=404, detail="Schedule not found")
-    conn.execute("UPDATE schedules SET status = 'rejected' WHERE id = ?", (schedule_id,))
+    cur.execute("UPDATE schedules SET status = 'rejected' WHERE id = %s", (schedule_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Session rejected"}
 
@@ -341,18 +373,20 @@ def get_admin(authorization: str = Header(...)):
 @app.get("/admin/users")
 def list_users(_=Depends(get_admin)):
     conn = get_connection()
-    rows = conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         SELECT u.id, u.name, u.email, u.phone, u.location, u.created_at,
                p.id as payment_id, p.plan, p.amount, p.transaction_id, p.currency,
                p.status, p.created_at as paid_at, p.approved_at, p.client_meet_link
         FROM users u
         LEFT JOIN payments p ON p.user_id = u.id
         ORDER BY p.created_at DESC
-    """).fetchall()
+    """)
+    rows = fetchall_dict(cur)
+    cur.close()
     conn.close()
     result = []
-    for r in rows:
-        row = dict(r)
+    for row in rows:
         expires_at, is_expired = calc_expiry(row.get("approved_at"), row.get("plan") or "")
         row["expires_at"] = expires_at
         row["is_expired"] = is_expired
@@ -363,8 +397,10 @@ def list_users(_=Depends(get_admin)):
 @app.post("/admin/client-meet-link/{payment_id}")
 def set_client_meet_link(payment_id: int, data: ClientMeetLinkRequest, _=Depends(get_admin)):
     conn = get_connection()
-    conn.execute("UPDATE payments SET client_meet_link = ? WHERE id = ?", (data.link, payment_id))
+    cur = conn.cursor()
+    cur.execute("UPDATE payments SET client_meet_link = %s WHERE id = %s", (data.link, payment_id))
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Client meet link saved"}
 
@@ -372,21 +408,26 @@ def set_client_meet_link(payment_id: int, data: ClientMeetLinkRequest, _=Depends
 @app.get("/admin/schedules")
 def get_all_schedules(_=Depends(get_admin)):
     conn = get_connection()
-    rows = conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         SELECT s.*, u.name, u.email
         FROM schedules s
         JOIN users u ON u.id = s.user_id
         ORDER BY s.created_at DESC
-    """).fetchall()
+    """)
+    rows = fetchall_dict(cur)
+    cur.close()
     conn.close()
-    return [dict(r) for r in rows]
+    return rows
 
 
 @app.post("/admin/schedule/approve/{schedule_id}")
 def admin_approve_schedule(schedule_id: int, _=Depends(get_admin)):
     conn = get_connection()
-    conn.execute("UPDATE schedules SET status = 'confirmed' WHERE id = ?", (schedule_id,))
+    cur = conn.cursor()
+    cur.execute("UPDATE schedules SET status = 'confirmed' WHERE id = %s", (schedule_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Schedule confirmed"}
 
@@ -394,8 +435,10 @@ def admin_approve_schedule(schedule_id: int, _=Depends(get_admin)):
 @app.post("/admin/schedule/decline/{schedule_id}")
 def admin_decline_schedule(schedule_id: int, _=Depends(get_admin)):
     conn = get_connection()
-    conn.execute("UPDATE schedules SET status = 'declined' WHERE id = ?", (schedule_id,))
+    cur = conn.cursor()
+    cur.execute("UPDATE schedules SET status = 'declined' WHERE id = %s", (schedule_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Schedule declined"}
 
@@ -403,11 +446,13 @@ def admin_decline_schedule(schedule_id: int, _=Depends(get_admin)):
 @app.post("/admin/schedule/propose")
 def admin_propose_schedule(data: AdminScheduleProposeRequest, _=Depends(get_admin)):
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO schedules (payment_id, user_id, proposed_by, proposed_time, notes) VALUES (?, ?, 'admin', ?, ?)",
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO schedules (payment_id, user_id, proposed_by, proposed_time, notes) VALUES (%s, %s, 'admin', %s, %s)",
         (data.payment_id, data.user_id, data.proposed_time, data.notes)
     )
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Time proposed to client"}
 
@@ -415,20 +460,23 @@ def admin_propose_schedule(data: AdminScheduleProposeRequest, _=Depends(get_admi
 @app.get("/admin/meet-links")
 def get_meet_links(_=Depends(get_admin)):
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT key, value FROM settings WHERE key IN ('meet_6am','meet_8am','meet_11am')"
-    ).fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT key, value FROM settings WHERE key IN ('meet_6am','meet_8am','meet_11am')")
+    result = {r[0]: r[1] for r in cur.fetchall()}
+    cur.close()
     conn.close()
-    return {r["key"]: r["value"] for r in rows}
+    return result
 
 
 @app.post("/admin/meet-links")
 def save_meet_links(data: MeetLinksRequest, _=Depends(get_admin)):
     conn = get_connection()
-    conn.execute("UPDATE settings SET value = ? WHERE key = 'meet_6am'",  (data.meet_6am,))
-    conn.execute("UPDATE settings SET value = ? WHERE key = 'meet_8am'",  (data.meet_8am,))
-    conn.execute("UPDATE settings SET value = ? WHERE key = 'meet_11am'", (data.meet_11am,))
+    cur = conn.cursor()
+    cur.execute("UPDATE settings SET value = %s WHERE key = 'meet_6am'",  (data.meet_6am,))
+    cur.execute("UPDATE settings SET value = %s WHERE key = 'meet_8am'",  (data.meet_8am,))
+    cur.execute("UPDATE settings SET value = %s WHERE key = 'meet_11am'", (data.meet_11am,))
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Meet links saved"}
 
@@ -436,11 +484,13 @@ def save_meet_links(data: MeetLinksRequest, _=Depends(get_admin)):
 @app.post("/admin/approve/{payment_id}")
 def approve_payment(payment_id: int, _=Depends(get_admin)):
     conn = get_connection()
-    conn.execute(
-        "UPDATE payments SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE id = ?",
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE payments SET status = 'approved', approved_at = NOW() WHERE id = %s",
         (payment_id,)
     )
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Payment approved"}
 
@@ -448,8 +498,10 @@ def approve_payment(payment_id: int, _=Depends(get_admin)):
 @app.post("/admin/reject/{payment_id}")
 def reject_payment(payment_id: int, _=Depends(get_admin)):
     conn = get_connection()
-    conn.execute("UPDATE payments SET status = 'rejected' WHERE id = ?", (payment_id,))
+    cur = conn.cursor()
+    cur.execute("UPDATE payments SET status = 'rejected' WHERE id = %s", (payment_id,))
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Payment rejected"}
 
