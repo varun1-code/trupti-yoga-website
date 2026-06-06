@@ -1,0 +1,17 @@
+# FastAPI framework
+fastapi
+
+# ASGI server to run FastAPI
+uvicorn[standard]
+
+# Data validation
+pydantic
+
+# For handling form data
+python-multipart
+
+# For CORS (allow React frontend to talk to FastAPI)
+starlette
+
+# JWT authentication
+PyJWT
