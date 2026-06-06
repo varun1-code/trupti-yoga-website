@@ -192,9 +192,9 @@ def submit_payment(data: PaymentRequest, user_id: int = Depends(get_current_user
         (user_id, data.plan, amount, data.paypal_order_id or data.transaction_id, data.currency, status, approved_at)
     )
     conn.commit()
-    conn.close()
-    # Fetch user details for emails
+    # Fetch user details for emails before closing
     user = conn.execute("SELECT name, email FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
     u_name, u_email = user["name"], user["email"]
     amt_str = str(amount)
 
