@@ -54,10 +54,14 @@ def init_db():
             currency          TEXT    NOT NULL DEFAULT 'INR',
             client_meet_link  TEXT    DEFAULT '',
             status            TEXT    NOT NULL DEFAULT 'pending',
+            is_upgrade        BOOLEAN NOT NULL DEFAULT FALSE,
+            expires_at        TIMESTAMPTZ,
             created_at        TIMESTAMPTZ DEFAULT NOW(),
             approved_at       TIMESTAMPTZ
         )
     """)
+    cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS is_upgrade BOOLEAN NOT NULL DEFAULT FALSE")
+    cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (

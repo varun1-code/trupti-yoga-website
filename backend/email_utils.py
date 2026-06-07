@@ -1,4 +1,5 @@
 import os, smtplib, threading
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -206,6 +207,7 @@ def send_payment_approved(to: str, name: str, plan: str, amount: str,
 
 
 # ── 5. Payment rejected (to client) ──────────────────────
+
 def send_payment_rejected(to: str, name: str):
     html = _wrap(f"""
         <h2 style="margin:0 0 8px;color:#991b1b;font-size:22px;">Payment Not Verified</h2>
@@ -227,3 +229,116 @@ def send_payment_rejected(to: str, name: str):
         </div>
     """)
     _async(to, "Payment Not Verified | Trupti Yoga", html)
+
+
+def _fmt_date(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso.split('T')[0]).strftime("%d %B %Y")
+    except Exception:
+        return iso
+
+
+# ── 6. Expiry warning (to client) — 7 days or 1 day before ──
+
+def send_expiry_warning(to: str, name: str, plan: str, expires_at: str, days: int):
+    label    = PLAN_LABELS.get(plan, plan)
+    exp_date = _fmt_date(expires_at)
+    is_urgent = days == 1
+    accent   = "#991b1b" if is_urgent else "#92400e"
+    bg       = "#fef2f2" if is_urgent else "#fffbeb"
+    border   = "#fecaca" if is_urgent else "#fde68a"
+    icon     = "🚨" if is_urgent else "⚠️"
+    subject  = f"{'Urgent: ' if is_urgent else ''}Your Membership Expires {'Tomorrow' if is_urgent else f'in {days} Days'} | Trupti Yoga"
+
+    html = _wrap(f"""
+        <h2 style="margin:0 0 8px;color:{accent};font-size:22px;">
+            {icon} Membership Expiring {'Tomorrow' if is_urgent else f'in {days} Days'}
+        </h2>
+        <p style="color:#374151;font-size:15px;line-height:1.7;margin:0 0 20px;">
+            Dear <strong>{name}</strong>,
+            {'<br>This is an urgent reminder —' if is_urgent else ''} your
+            <strong>Trupti Yoga & Nature Cure</strong> membership is set to expire on
+            <strong style="color:{accent};">{exp_date}</strong>.
+            {'After this date, you will lose access to all live sessions.' if is_urgent else
+             'Please renew soon to ensure uninterrupted access to your daily sessions.'}
+        </p>
+        <table style="background:{bg};border:1px solid {border};border-radius:12px;padding:16px 24px;margin:0 0 24px;width:100%;border-collapse:collapse;">
+            {_info_row("Plan", label)}
+            {_info_row("Expires On", exp_date)}
+            {_info_row("Days Left", f"{'1 day — renew now!' if is_urgent else f'{days} days'}")}
+        </table>
+        <p style="color:#374151;font-size:14px;line-height:1.7;margin:0 0 24px;">
+            To renew, simply choose a new plan on the website and complete the payment.
+            Your sessions will continue without any interruption.
+        </p>
+        <div style="text-align:center;margin-bottom:16px;">
+            {_btn("Renew My Membership →", f"{SITE_URL}/payment")}
+        </div>
+        <div style="text-align:center;">
+            <a href="https://wa.me/918088943510" style="color:#059669;font-size:13px;">
+                Need help? Contact us on WhatsApp
+            </a>
+        </div>
+    """)
+    _async(to, subject, html)
+
+
+# ── 7. Expiry alert to admin — 1 day before ──────────────
+
+def send_admin_expiry_alert(admin_email: str, user_name: str, user_email: str,
+                            plan: str, expires_at: str):
+    label    = PLAN_LABELS.get(plan, plan)
+    exp_date = _fmt_date(expires_at)
+    html = _wrap(f"""
+        <h2 style="margin:0 0 8px;color:#92400e;font-size:22px;">⚠️ Membership Expiring Tomorrow</h2>
+        <p style="color:#374151;font-size:15px;line-height:1.7;margin:0 0 20px;">
+            A member's plan expires <strong>tomorrow ({exp_date})</strong>.
+            They have been notified via email. No action is required unless they reach out to renew.
+        </p>
+        <table style="background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:16px 24px;margin:0 0 24px;width:100%;border-collapse:collapse;">
+            {_info_row("Member", user_name)}
+            {_info_row("Email", user_email)}
+            {_info_row("Plan", label)}
+            {_info_row("Expires On", exp_date)}
+        </table>
+        <div style="text-align:center;">
+            {_btn("Open Admin Panel →", f"{SITE_URL}/admin")}
+        </div>
+    """)
+    _async(admin_email, f"⚠️ Membership Expiring Tomorrow — {user_name} | Trupti Yoga", html)
+
+
+# ── 8. Post-expiry recharge reminder (to client) — 3 days after ──
+
+def send_post_expiry_reminder(to: str, name: str, plan: str):
+    label = PLAN_LABELS.get(plan, plan)
+    html = _wrap(f"""
+        <h2 style="margin:0 0 8px;color:#065f46;font-size:22px;">We Miss You, {name}! 🙏</h2>
+        <p style="color:#374151;font-size:15px;line-height:1.7;margin:0 0 20px;">
+            Your <strong>{label}</strong> membership with
+            <strong>Trupti Yoga & Nature Cure</strong> has expired.
+            It has been a few days since your last session — we hope you are well.
+        </p>
+        <p style="color:#374151;font-size:15px;line-height:1.7;margin:0 0 20px;">
+            Your wellness journey doesn't have to stop here. Dr. Vishwa Hiremath continues
+            to conduct <strong>three live therapeutic yoga sessions every day</strong>
+            and your spot is always open.
+        </p>
+        <table style="background:#f0fdf4;border-radius:12px;padding:16px 20px;margin:0 0 24px;width:100%;border-collapse:collapse;">
+            <tr><td style="padding:6px 12px;font-size:14px;color:#065f46;">🌅 <strong>6:00 AM IST</strong> — Early Morning Session</td></tr>
+            <tr><td style="padding:6px 12px;font-size:14px;color:#065f46;">☀️ <strong>8:00 AM IST</strong> — Morning Session</td></tr>
+            <tr><td style="padding:6px 12px;font-size:14px;color:#065f46;">🌿 <strong>11:00 AM IST</strong> — Late Morning Session</td></tr>
+        </table>
+        <p style="color:#6b7280;font-size:14px;font-style:italic;margin:0 0 28px;text-align:center;">
+            "One Breath. One Step. Slowly but Surely."
+        </p>
+        <div style="text-align:center;margin-bottom:16px;">
+            {_btn("Reactivate My Membership →", f"{SITE_URL}/payment")}
+        </div>
+        <div style="text-align:center;">
+            <a href="https://wa.me/918088943510" style="color:#059669;font-size:13px;">
+                Questions? We're on WhatsApp
+            </a>
+        </div>
+    """)
+    _async(to, "Your Membership Has Expired — We'd Love to Have You Back | Trupti Yoga", html)

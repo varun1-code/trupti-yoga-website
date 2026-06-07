@@ -54,6 +54,9 @@ export default function AdminPanel() {
   const [clientLinkSaved, setClientLinkSaved]   = useState(false)
   const [clientLinkSaving, setClientLinkSaving] = useState(false)
 
+  // ── Upgrade approval ──
+  const [upgradeExpiresDate, setUpgradeExpiresDate] = useState('')
+
   // ── Schedules ──
   const [allSchedules, setAllSchedules]       = useState([])
   const [adminProposeTime, setAdminProposeTime] = useState('')
@@ -162,13 +165,16 @@ export default function AdminPanel() {
     }
   }
 
-  const approve = async (paymentId) => {
+  const approve = async (paymentId, expiresAt = null) => {
     const res = await fetch(`${API_URL}/admin/approve/${paymentId}`, {
-      method: 'POST', headers: authHeader,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeader },
+      body: JSON.stringify({ expires_at: expiresAt }),
     })
     if (res.ok) {
+      setUpgradeExpiresDate('')
       await fetchUsers()
-      setSelectedUser((prev) => ({ ...prev, status: 'approved' }))
+      setSelectedUser((prev) => ({ ...prev, status: 'approved', expires_at: expiresAt }))
     }
   }
 
@@ -440,7 +446,7 @@ export default function AdminPanel() {
                 {active.sort((a, b) => a.name.localeCompare(b.name)).map((u) => (
                   <button
                     key={u.payment_id || u.id}
-                    onClick={() => { setSelectedUser(u); setClientLink(u.client_meet_link || ''); setClientLinkSaved(false); setView('user-detail') }}
+                    onClick={() => { setSelectedUser(u); setClientLink(u.client_meet_link || ''); setClientLinkSaved(false); setUpgradeExpiresDate(''); setView('user-detail') }}
                     className="bg-white rounded-2xl shadow-sm border border-green-100 p-4 flex items-center justify-between hover:shadow-md transition-all text-left"
                   >
                     <div className="flex items-center gap-4">
@@ -461,6 +467,9 @@ export default function AdminPanel() {
                     <div className="flex items-center gap-2">
                       {u.plan?.startsWith('1to1') && (
                         <span className="bg-purple-100 text-purple-700 text-xs font-medium px-2 py-0.5 rounded-full">1:1</span>
+                      )}
+                      {u.is_upgrade && (
+                        <span className="bg-blue-100 text-blue-700 text-xs font-medium px-2 py-0.5 rounded-full">Upgrade</span>
                       )}
                       <span className="bg-green-100 text-green-700 text-xs font-medium px-2.5 py-1 rounded-full">Active</span>
                       <span className="text-gray-300 text-sm">›</span>
@@ -490,7 +499,7 @@ export default function AdminPanel() {
                   return (
                     <button
                       key={u.payment_id || u.id}
-                      onClick={() => { setSelectedUser(u); setClientLink(u.client_meet_link || ''); setClientLinkSaved(false); setView('user-detail') }}
+                      onClick={() => { setSelectedUser(u); setClientLink(u.client_meet_link || ''); setClientLinkSaved(false); setUpgradeExpiresDate(''); setView('user-detail') }}
                       className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 flex items-center justify-between hover:shadow-md transition-all text-left"
                     >
                       <div className="flex items-center gap-4">
@@ -506,7 +515,10 @@ export default function AdminPanel() {
                           )}
                         </div>
                       </div>
-                      <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-2">
+                        {u.is_upgrade && u.status === 'pending' && (
+                          <span className="bg-blue-100 text-blue-700 text-xs font-medium px-2 py-0.5 rounded-full">Upgrade</span>
+                        )}
                         <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${badge}`}>{label}</span>
                         <span className="text-gray-300 text-sm">›</span>
                       </div>
@@ -548,6 +560,9 @@ export default function AdminPanel() {
                 </span>
                 {is1to1 && (
                   <span className="ml-2 text-xs font-semibold px-2.5 py-1 rounded-full bg-purple-100 text-purple-700">One-to-One</span>
+                )}
+                {u.is_upgrade && (
+                  <span className="ml-2 text-xs font-semibold px-2.5 py-1 rounded-full bg-blue-100 text-blue-700">Upgrade Request</span>
                 )}
               </div>
             </div>
@@ -601,19 +616,58 @@ export default function AdminPanel() {
               </div>
 
               {u.status === 'pending' && (
-                <div className="flex gap-3 pt-4 border-t border-gray-100">
-                  <button
-                    onClick={() => approve(u.payment_id)}
-                    className="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-2xl transition-all"
-                  >
-                    Approve Payment
-                  </button>
-                  <button
-                    onClick={() => reject(u.payment_id)}
-                    className="flex-1 bg-red-100 hover:bg-red-200 text-red-600 font-bold py-3 rounded-2xl transition-all"
-                  >
-                    Reject
-                  </button>
+                <div className="pt-4 border-t border-gray-100">
+                  {u.is_upgrade ? (
+                    <div className="flex flex-col gap-3">
+                      <div className="bg-blue-50 border border-blue-200 rounded-2xl px-4 py-3 text-sm text-blue-700">
+                        <p className="font-semibold mb-0.5">Upgrade Request</p>
+                        <p>Verify the transaction ID, then set the membership validity period before approving.</p>
+                      </div>
+                      <div>
+                        <label className="text-xs font-semibold text-gray-600 mb-1 block">Valid Until (required)</label>
+                        <input
+                          type="date"
+                          value={upgradeExpiresDate}
+                          onChange={(e) => setUpgradeExpiresDate(e.target.value)}
+                          min={new Date().toISOString().split('T')[0]}
+                          className="w-full border-2 border-gray-200 rounded-2xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-400 transition-colors"
+                        />
+                      </div>
+                      <div className="flex gap-3">
+                        <button
+                          onClick={() => {
+                            if (!upgradeExpiresDate) return
+                            approve(u.payment_id, upgradeExpiresDate)
+                          }}
+                          disabled={!upgradeExpiresDate}
+                          className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 disabled:cursor-not-allowed text-white font-bold py-3 rounded-2xl transition-all"
+                        >
+                          Approve Upgrade
+                        </button>
+                        <button
+                          onClick={() => reject(u.payment_id)}
+                          className="flex-1 bg-red-100 hover:bg-red-200 text-red-600 font-bold py-3 rounded-2xl transition-all"
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex gap-3">
+                      <button
+                        onClick={() => approve(u.payment_id)}
+                        className="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-2xl transition-all"
+                      >
+                        Approve Payment
+                      </button>
+                      <button
+                        onClick={() => reject(u.payment_id)}
+                        className="flex-1 bg-red-100 hover:bg-red-200 text-red-600 font-bold py-3 rounded-2xl transition-all"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 

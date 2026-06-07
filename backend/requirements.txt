@@ -18,3 +18,9 @@ PyJWT
 
 # PostgreSQL driver
 psycopg2-binary
+
+# Load .env file into os.environ
+python-dotenv
+
+# Background job scheduler (expiry reminders)
+APScheduler

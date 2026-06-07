@@ -1,4 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, Depends, Header, Body
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import hashlib, os
@@ -7,7 +11,10 @@ import psycopg2
 from datetime import datetime, timedelta, timezone
 from models import get_connection, init_db, fetchone_dict, fetchall_dict
 from email_utils import (send_welcome, send_payment_received, send_admin_new_payment,
-                         send_payment_approved, send_payment_rejected)
+                         send_payment_approved, send_payment_rejected,
+                         send_expiry_warning, send_admin_expiry_alert, send_post_expiry_reminder)
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 app = FastAPI()
 
@@ -61,14 +68,19 @@ PLAN_DAYS = {
 }
 
 
-def calc_expiry(approved_at_val, plan: str):
+def calc_expiry(approved_at_val, plan: str, expires_at_stored=None):
+    if expires_at_stored:
+        ea = datetime.fromisoformat(str(expires_at_stored).replace('Z', '+00:00')) \
+            if isinstance(expires_at_stored, str) else expires_at_stored
+        if ea.tzinfo is not None:
+            ea = ea.replace(tzinfo=None)
+        return ea.isoformat(), datetime.now() > ea
     if not approved_at_val:
         return None, False
     if isinstance(approved_at_val, str):
         approved_at = datetime.fromisoformat(approved_at_val)
     else:
         approved_at = approved_at_val
-    # make naive for comparison
     if approved_at.tzinfo is not None:
         approved_at = approved_at.replace(tzinfo=None)
     expires_at = approved_at + timedelta(days=PLAN_DAYS.get(plan, 30))
@@ -106,6 +118,10 @@ class PaymentRequest(BaseModel):
     transaction_id: str = ""
     currency: str = "INR"
     paypal_order_id: str = ""
+    is_upgrade: bool = False
+
+class ApproveRequest(BaseModel):
+    expires_at: Optional[str] = None
 
 class AdminLoginRequest(BaseModel):
     email: str
@@ -193,19 +209,23 @@ def submit_payment(data: PaymentRequest, user_id: int = Depends(get_current_user
     if existing:
         if existing["status"] == "pending":
             cur.close(); conn.close()
-            raise HTTPException(status_code=400, detail="You already have a payment awaiting approval")
-        _, is_expired = calc_expiry(existing["approved_at"], existing["plan"])
+            detail = "You already have an upgrade request awaiting approval" \
+                if existing.get("is_upgrade") else "You already have a payment awaiting approval"
+            raise HTTPException(status_code=400, detail=detail)
+        _, is_expired = calc_expiry(existing["approved_at"], existing["plan"], existing.get("expires_at"))
         if not is_expired:
-            cur.close(); conn.close()
-            raise HTTPException(status_code=400, detail="You already have an active membership")
+            if not data.is_upgrade:
+                cur.close(); conn.close()
+                raise HTTPException(status_code=400, detail="You already have an active membership")
 
-    is_paypal  = bool(data.paypal_order_id)
-    status     = "approved" if is_paypal else "pending"
+    is_paypal   = bool(data.paypal_order_id)
+    status      = "approved" if is_paypal else "pending"
     approved_at = datetime.now().isoformat() if is_paypal else None
+    stored_amount = 0 if data.is_upgrade else amount
 
     cur.execute(
-        "INSERT INTO payments (user_id, plan, amount, transaction_id, currency, status, approved_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (user_id, data.plan, amount, data.paypal_order_id or data.transaction_id, data.currency, status, approved_at)
+        "INSERT INTO payments (user_id, plan, amount, transaction_id, currency, status, approved_at, is_upgrade) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (user_id, data.plan, stored_amount, data.paypal_order_id or data.transaction_id, data.currency, status, approved_at, data.is_upgrade)
     )
     conn.commit()
 
@@ -223,14 +243,18 @@ def submit_payment(data: PaymentRequest, user_id: int = Depends(get_current_user
         if expires_at:
             exp_str = datetime.fromisoformat(expires_at).strftime("%d %b %Y")
         send_payment_approved(u_email, u_name, data.plan, amt_str, data.currency, exp_str)
+    elif data.is_upgrade:
+        send_admin_new_payment(ADMIN_EMAIL, u_name, u_email, data.plan, "Custom (Upgrade)", data.currency, data.transaction_id)
     else:
         send_payment_received(u_email, u_name, data.plan, amt_str, data.currency)
-        send_admin_new_payment(
-            ADMIN_EMAIL, u_name, u_email, data.plan, amt_str,
-            data.currency, data.transaction_id
-        )
+        send_admin_new_payment(ADMIN_EMAIL, u_name, u_email, data.plan, amt_str, data.currency, data.transaction_id)
 
-    msg = "Payment successful. Your membership is now active!" if is_paypal else "Payment submitted. Awaiting approval."
+    if is_paypal:
+        msg = "Payment successful. Your membership is now active!"
+    elif data.is_upgrade:
+        msg = "Upgrade request submitted. Admin will verify and activate your new plan."
+    else:
+        msg = "Payment submitted. Awaiting approval."
     return {"message": msg, "auto_approved": is_paypal}
 
 
@@ -246,20 +270,30 @@ def get_dashboard(user_id: int = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="User not found")
 
     cur.execute(
-        "SELECT * FROM payments WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
+        "SELECT * FROM payments WHERE user_id = %s ORDER BY created_at DESC LIMIT 5",
         (user_id,)
     )
-    payment = fetchone_dict(cur)
+    all_payments = fetchall_dict(cur)
+
+    # Separate the active/latest payment from any pending upgrade request
+    payment = None
+    pending_upgrade_row = None
+    for p in all_payments:
+        if p.get("is_upgrade") and p["status"] == "pending" and pending_upgrade_row is None:
+            pending_upgrade_row = p
+        elif payment is None:
+            payment = p
 
     result = {
         "name": user["name"], "email": user["email"],
         "phone": user["phone"], "location": user["location"],
         "payment": None,
+        "pending_upgrade": None,
     }
 
     if payment:
         meet_6am = meet_8am = meet_11am = ""
-        expires_at, is_expired = calc_expiry(payment.get("approved_at"), payment.get("plan", ""))
+        expires_at, is_expired = calc_expiry(payment.get("approved_at"), payment.get("plan", ""), payment.get("expires_at"))
         is_1to1 = payment.get("plan", "").startswith("1to1")
         if payment["status"] == "approved" and not is_expired and not is_1to1:
             cur.execute("SELECT key, value FROM settings WHERE key IN ('meet_6am','meet_8am','meet_11am')")
@@ -275,10 +309,16 @@ def get_dashboard(user_id: int = Depends(get_current_user)):
             "expires_at":       expires_at,
             "is_expired":       is_expired,
             "is_1to1":          is_1to1,
+            "is_upgrade":       bool(payment.get("is_upgrade")),
             "client_meet_link": payment.get("client_meet_link") or "",
             "meet_6am":         meet_6am,
             "meet_8am":         meet_8am,
             "meet_11am":        meet_11am,
+        }
+
+    if pending_upgrade_row:
+        result["pending_upgrade"] = {
+            "plan": pending_upgrade_row["plan"],
         }
 
     cur.close()
@@ -375,19 +415,24 @@ def list_users(_=Depends(get_admin)):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT u.id, u.name, u.email, u.phone, u.location, u.created_at,
-               p.id as payment_id, p.plan, p.amount, p.transaction_id, p.currency,
-               p.status, p.created_at as paid_at, p.approved_at, p.client_meet_link
-        FROM users u
-        LEFT JOIN payments p ON p.user_id = u.id
-        ORDER BY p.created_at DESC
+        SELECT * FROM (
+            SELECT DISTINCT ON (u.id)
+                u.id, u.name, u.email, u.phone, u.location, u.created_at,
+                p.id as payment_id, p.plan, p.amount, p.transaction_id, p.currency,
+                p.status, p.created_at as paid_at, p.approved_at, p.client_meet_link,
+                p.is_upgrade, p.expires_at as stored_expires_at
+            FROM users u
+            LEFT JOIN payments p ON p.user_id = u.id
+            ORDER BY u.id, p.created_at DESC NULLS LAST
+        ) sub
+        ORDER BY paid_at DESC NULLS LAST
     """)
     rows = fetchall_dict(cur)
     cur.close()
     conn.close()
     result = []
     for row in rows:
-        expires_at, is_expired = calc_expiry(row.get("approved_at"), row.get("plan") or "")
+        expires_at, is_expired = calc_expiry(row.get("approved_at"), row.get("plan") or "", row.get("stored_expires_at"))
         row["expires_at"] = expires_at
         row["is_expired"] = is_expired
         result.append(row)
@@ -482,13 +527,19 @@ def save_meet_links(data: MeetLinksRequest, _=Depends(get_admin)):
 
 
 @app.post("/admin/approve/{payment_id}")
-def approve_payment(payment_id: int, _=Depends(get_admin)):
+def approve_payment(payment_id: int, data: ApproveRequest = Body(default=ApproveRequest()), _=Depends(get_admin)):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        "UPDATE payments SET status = 'approved', approved_at = NOW() WHERE id = %s",
-        (payment_id,)
-    )
+    if data and data.expires_at:
+        cur.execute(
+            "UPDATE payments SET status = 'approved', approved_at = NOW(), expires_at = %s WHERE id = %s",
+            (data.expires_at, payment_id)
+        )
+    else:
+        cur.execute(
+            "UPDATE payments SET status = 'approved', approved_at = NOW() WHERE id = %s",
+            (payment_id,)
+        )
     conn.commit()
     cur.close()
     conn.close()
@@ -506,8 +557,50 @@ def reject_payment(payment_id: int, _=Depends(get_admin)):
     return {"message": "Payment rejected"}
 
 
+# ── Expiry reminder job ───────────────────────────────────
+
+def check_expiry_reminders():
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT DISTINCT ON (p.user_id)
+                p.*, u.name AS user_name, u.email AS user_email
+            FROM payments p
+            JOIN users u ON u.id = p.user_id
+            WHERE p.status = 'approved'
+            ORDER BY p.user_id, p.created_at DESC
+        """)
+        payments = fetchall_dict(cur)
+    finally:
+        cur.close()
+        conn.close()
+
+    today = datetime.now().date()
+    for p in payments:
+        expires_at, _ = calc_expiry(p.get("approved_at"), p.get("plan", ""), p.get("expires_at"))
+        if not expires_at:
+            continue
+        expiry_date = datetime.fromisoformat(expires_at.split('T')[0]).date()
+        days_left   = (expiry_date - today).days
+        name        = p["user_name"]
+        email       = p["user_email"]
+        plan        = p["plan"]
+
+        if days_left == 7:
+            send_expiry_warning(email, name, plan, expires_at, days=7)
+        elif days_left == 1:
+            send_expiry_warning(email, name, plan, expires_at, days=1)
+            send_admin_expiry_alert(ADMIN_EMAIL, name, email, plan, expires_at)
+        elif days_left == -3:
+            send_post_expiry_reminder(email, name, plan)
+
+
 # ── Startup ───────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
     init_db()
+    scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+    scheduler.add_job(check_expiry_reminders, CronTrigger(hour=8, minute=0))
+    scheduler.start()

@@ -136,7 +136,8 @@ export default function Dashboard() {
     </div>
   )
 
-  const payment  = data.payment
+  const payment        = data.payment
+  const pendingUpgrade = data.pending_upgrade
   const currency = payment?.currency || 'INR'
   const symbol   = currency === 'USD' ? '$' : '₹'
   const amount   = payment?.amount?.toLocaleString() ?? ''
@@ -233,16 +234,37 @@ export default function Dashboard() {
               : null
             return (
               <>
-                <div className="bg-green-50 border border-green-200 rounded-2xl px-6 py-4 mb-4 flex items-center gap-3">
-                  <span className="text-2xl">✅</span>
-                  <div>
-                    <p className="font-semibold text-green-800">Membership Active</p>
-                    <p className="text-green-600 text-sm">
-                      {PLAN_LABELS[payment.plan] || payment.plan} · {symbol}{amount}
-                      {expiryDate && <span className="text-green-500"> · Expires {expiryDate}</span>}
+                <div className="bg-green-50 border border-green-200 rounded-2xl px-6 py-4 mb-4 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <span className="text-2xl">✅</span>
+                    <div>
+                      <p className="font-semibold text-green-800">Membership Active</p>
+                      <p className="text-green-600 text-sm">
+                        {PLAN_LABELS[payment.plan] || payment.plan}
+                        {!payment.is_upgrade && amount > 0 && ` · ${symbol}${amount}`}
+                        {expiryDate && <span className="text-green-500"> · Expires {expiryDate}</span>}
+                      </p>
+                    </div>
+                  </div>
+                  {!pendingUpgrade && (
+                    <Link
+                      to="/payment?upgrade=1"
+                      className="flex-shrink-0 text-xs bg-purple-100 hover:bg-purple-200 text-purple-700 font-semibold px-3 py-2 rounded-xl transition-all"
+                    >
+                      Upgrade Plan
+                    </Link>
+                  )}
+                </div>
+
+                {pendingUpgrade && (
+                  <div className="bg-purple-50 border border-purple-200 rounded-2xl px-5 py-3 mb-4 flex items-center gap-3">
+                    <span className="text-lg">⬆️</span>
+                    <p className="text-purple-700 text-sm">
+                      <span className="font-semibold">Upgrade request pending</span> — upgrading to{' '}
+                      {PLAN_LABELS[pendingUpgrade.plan] || pendingUpgrade.plan}. Admin will activate once verified.
                     </p>
                   </div>
-                </div>
+                )}
 
                 {/* One-to-One private session */}
                 {payment.is_1to1 && (
